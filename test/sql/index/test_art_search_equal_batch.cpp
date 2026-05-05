@@ -118,3 +118,84 @@ TEST_CASE("SearchEqualBatch - basic lookups", "[art]") {
 		REQUIRE(row_ids.size() == count);
 	}
 }
+
+TEST_CASE("SearchEqualBatch - BIGINT keys", "[art]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t_big(id BIGINT PRIMARY KEY)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t_big SELECT i FROM range(5000) tbl(i)"));
+
+	con.BeginTransaction();
+	auto &art = GetPKIndex(con, "t_big");
+
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+	auto data = FlatVector::GetData<int64_t>(input.data[0]);
+
+	// Lookup a batch of 2048 keys (full STANDARD_VECTOR_SIZE)
+	idx_t count = MinValue<idx_t>(2048, STANDARD_VECTOR_SIZE);
+	for (idx_t i = 0; i < count; i++) {
+		data[i] = static_cast<int64_t>(i * 2); // even numbers 0,2,4,...,4094
+	}
+	input.SetCardinality(count);
+
+	duckdb::vector<row_t> row_ids;
+	art.SearchEqualBatch(input, row_ids);
+
+	REQUIRE(row_ids.size() == count);
+}
+
+TEST_CASE("SearchEqualBatch - VARCHAR keys", "[art]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t_str(id VARCHAR PRIMARY KEY)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t_str VALUES ('alpha'), ('beta'), ('gamma'), ('delta'), "
+	                           "('a_very_long_string_that_exceeds_inline_storage_for_testing_purposes')"));
+
+	con.BeginTransaction();
+	auto &art = GetPKIndex(con, "t_str");
+
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR});
+
+	// Look up 3 keys: 2 exist, 1 doesn't
+	input.data[0].SetValue(0, Value("beta"));
+	input.data[0].SetValue(1, Value("missing"));
+	input.data[0].SetValue(2, Value("a_very_long_string_that_exceeds_inline_storage_for_testing_purposes"));
+	input.SetCardinality(3);
+
+	duckdb::vector<row_t> row_ids;
+	art.SearchEqualBatch(input, row_ids);
+
+	REQUIRE(row_ids.size() == 2);
+}
+
+TEST_CASE("SearchEqualBatch - composite key", "[art]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t_comp(a INTEGER, b INTEGER, PRIMARY KEY(a, b))"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t_comp VALUES (1, 10), (1, 20), (2, 10), (2, 20), (3, 30)"));
+
+	con.BeginTransaction();
+	auto &art = GetPKIndex(con, "t_comp");
+
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER, LogicalType::INTEGER});
+	auto col_a = FlatVector::GetData<int32_t>(input.data[0]);
+	auto col_b = FlatVector::GetData<int32_t>(input.data[1]);
+
+	// (1,10) exists, (1,30) doesn't, (2,20) exists, (9,9) doesn't
+	col_a[0] = 1; col_b[0] = 10;
+	col_a[1] = 1; col_b[1] = 30;
+	col_a[2] = 2; col_b[2] = 20;
+	col_a[3] = 9; col_b[3] = 9;
+	input.SetCardinality(4);
+
+	duckdb::vector<row_t> row_ids;
+	art.SearchEqualBatch(input, row_ids);
+
+	REQUIRE(row_ids.size() == 2);
+}
